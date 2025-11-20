@@ -156,6 +156,8 @@ def main():
                             gesture_obj = Gesture_Data(class_name=g_name, ID=target.id, probability=g_conf)
 
                 # Send
+                print(f"{detection_list=}")
+                print(f"{gesture_obj}")
                 ai_packet = AI_Data(detection_list, gesture_obj)
                 try:
                     data = pickle.dumps(ai_packet)
