@@ -24,5 +24,5 @@ ssh ip@10.105.1.167
 geicar
 cd ros2_ws
 source_ws
-ros2 topic echo /ai_perceptron_data
+ros2 topic echo /ai_perception_data
 ```
