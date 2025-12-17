@@ -10,102 +10,122 @@ import torch
 import threading
 from ai_data_class import AI_Data, Detection, Gesture_Data, SOCKET_PORT, MAX_MSG_LEN
 
-# ----------------------------
-# Configuration
-# ----------------------------
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 HOST = '192.168.1.1'
-YOLO_MODEL_NAME = "yolo11n.engine"
-CONF_THRESHOLD = 0.5
+
+YOLO_MODEL_NAME = "yolo11n.engine"      # TensorRT engine on Jetson
+CONF_THRESHOLD = 0.5                   # YOLO confidence threshold
 DEVICE = 0 if torch.cuda.is_available() else 'cpu'
-FRAME_SKIP = 3
+
+FRAME_SKIP = 3                         # YOLO runs every N frames
+
+GESTURE_CONF_THRESHOLD = 60.0          # Minimum gesture confidence (%)
+GESTURE_ACTION_DELAY = 1.0             # Debounce time (seconds)
 
 RATIO_THRESHOLD_UP = 1.3
 RATIO_THRESHOLD_DOWN = 1.1
-GESTURE_CONF_THRESHOLD = 60.0
-GESTURE_ACTION_DELAY = 1.0  # seconds
 
-# ----------------------------
-# FSM States
-# ----------------------------
-STATE_IDLE = 0
-STATE_CONTROL = 1
+# ============================================================
+# FINITE STATE MACHINE DEFINITIONS
+# ============================================================
+
+STATE_IDLE = 0     # Waiting for Thumb_Up
+STATE_CONTROL = 1  # Actively controlling one person
 
 current_state = STATE_IDLE
 active_person_id = None
 
+# Global binary command (sent asynchronously)
 Following_state = 0
+
+# Used to avoid re-sending identical values
 last_sent_following_state = None
+
+# Timestamp used for gesture debounce
 last_action_time = 0.0
 
-# ----------------------------
-# Init Models
-# ----------------------------
-print(f"Loading YOLO on device='{DEVICE}'...")
+# ============================================================
+# MODEL INITIALIZATION
+# ============================================================
+
+print("[INFO] Loading YOLO model...")
 try:
     model = YOLO(YOLO_MODEL_NAME, task='detect')
 except Exception:
+    print("[WARN] TensorRT engine not found, loading .pt model")
     model = YOLO("yolo11n.pt")
 
-try:
-    model.predict(source=np.zeros((640, 640, 3), dtype=np.uint8),
-                  device=DEVICE, verbose=False)
-except:
-    pass
+# GPU warmup
+model.predict(
+    source=np.zeros((640, 640, 3), dtype=np.uint8),
+    device=DEVICE,
+    verbose=False
+)
 
-print("Loading MediaPipe...")
+print("[INFO] Loading MediaPipe Hands...")
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
     max_num_hands=1,
-    model_complexity=0,
+    model_complexity=0,                # Low complexity for Jetson
     min_detection_confidence=0.5,
     min_tracking_confidence=0.5,
 )
 
-# ----------------------------
-# Math / Gesture Functions
-# ----------------------------
+# ============================================================
+# GEOMETRY & GESTURE CLASSIFICATION
+# ============================================================
+
 def calc_distance(p1, p2):
+    """Euclidean distance between two MediaPipe landmarks"""
     return math.hypot(p1.x - p2.x, p1.y - p2.y)
 
 def analyze_finger_states(lm):
+    """
+    Determines which fingers are raised using geometric ratios.
+    Returns:
+        states  -> [thumb, index, middle, ring, pinky] (bool)
+        clarity -> per-finger confidence scores
+    """
     finger_tips = [8, 12, 16, 20]
     finger_pips = [6, 10, 14, 18]
     wrist = lm[0]
+
     states = []
     clarity = []
 
+    # --- Thumb logic (anti-fist protection) ---
     pinky_mcp = lm[17]
     index_mcp = lm[5]
 
-    dist_tip_pinky = calc_distance(lm[4], pinky_mcp)
-    dist_ip_pinky = calc_distance(lm[3], pinky_mcp)
-    dist_tip_index = calc_distance(lm[4], index_mcp)
-    palm_width = calc_distance(lm[5], lm[17])
-
-    thumb_up = (dist_tip_pinky > dist_ip_pinky * 1.1) and \
-               (dist_tip_index > palm_width * 0.35)
+    thumb_up = (
+        calc_distance(lm[4], pinky_mcp) >
+        calc_distance(lm[3], pinky_mcp) * 1.1 and
+        calc_distance(lm[4], index_mcp) >
+        calc_distance(lm[5], lm[17]) * 0.35
+    )
 
     states.append(thumb_up)
     clarity.append(1.0 if thumb_up else 0.5)
 
+    # --- Other fingers ---
     for tip, pip in zip(finger_tips, finger_pips):
         d_tip = calc_distance(lm[tip], wrist)
         d_pip = calc_distance(lm[pip], wrist)
-        ratio = d_tip / (d_pip + 1e-6)
         is_up = d_tip > d_pip
         states.append(is_up)
-
-        if is_up:
-            score = min(max((ratio - 1.0) /
-                            (RATIO_THRESHOLD_UP - 1.0), 0.5), 1.0)
-        else:
-            score = min(max((RATIO_THRESHOLD_DOWN - ratio) /
-                            (RATIO_THRESHOLD_DOWN - 0.8), 0.5), 1.0)
-        clarity.append(score)
+        clarity.append(1.0 if is_up else 0.5)
 
     return states, clarity
 
 def classify_gesture(landmarks):
+    """
+    Classifies the hand gesture based on finger states.
+    Returns:
+        gesture_name, confidence (%)
+    """
     states, clarity = analyze_finger_states(landmarks)
 
     patterns = {
@@ -115,55 +135,67 @@ def classify_gesture(landmarks):
         "Rock_n_Roll": [False, True, False, False, True],
     }
 
-    for label, pattern in patterns.items():
+    for name, pattern in patterns.items():
         if states == pattern:
-            conf = sum(clarity) / 5.0 * 100
-            return label, conf
+            return name, sum(clarity) / 5.0 * 100.0
 
     return "none", 0.0
 
-# ----------------------------
-# TCP
-# ----------------------------
+# ============================================================
+# TCP COMMUNICATION
+# ============================================================
+
 def connect_socket(port):
+    """Blocking TCP connection with retry"""
     while True:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.connect((HOST, port))
+            print(f"[TCP] Connected on port {port}")
             return s
         except:
             time.sleep(1)
 
 def following_state_sender():
+    """
+    Asynchronous thread.
+    Sends Following_state ONLY when it changes (edge-triggered).
+    """
     global last_sent_following_state
+
     while True:
         try:
             sock = connect_socket(SOCKET_PORT + 1)
             while True:
                 if Following_state != last_sent_following_state:
                     sock.send(pickle.dumps(Following_state))
+                    print(f"[TCP] Following_state sent: {Following_state}")
                     last_sent_following_state = Following_state
-                time.sleep(0.2)
+                time.sleep(0.05)
         except:
             time.sleep(1)
 
-# ----------------------------
-# Main
-# ----------------------------
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
 def main():
     global current_state, active_person_id
     global Following_state, last_action_time, last_sent_following_state
 
-    threading.Thread(target=following_state_sender, daemon=True).start()
+    # Start async Following_state sender
+    threading.Thread(
+        target=following_state_sender,
+        daemon=True
+    ).start()
 
     cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
     sock = connect_socket(SOCKET_PORT)
 
     frame_count = 0
     cached_detections = []
+
+    print("[INFO] System started. Waiting for gestures...")
 
     while True:
         ret, frame = cap.read()
@@ -172,41 +204,55 @@ def main():
 
         frame_count += 1
 
-        # ---------------- YOLO ----------------
+        # ----------------------------------------------------
+        # YOLO DETECTION (FRAME SKIPPING)
+        # ----------------------------------------------------
         if frame_count % FRAME_SKIP == 0:
-            results = model.track(frame, classes=[0], persist=True,
-                                  device=DEVICE, conf=CONF_THRESHOLD,
-                                  verbose=False)
-            cached_detections = []
+            results = model.track(
+                frame,
+                classes=[0],
+                persist=True,
+                device=DEVICE,
+                conf=CONF_THRESHOLD,
+                verbose=False
+            )
 
+            cached_detections = []
             if results[0].boxes:
                 for box in results[0].boxes:
                     x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                    track_id = int(box.id[0]) if box.id is not None else -1
-                    conf = float(box.conf[0])
-
                     cached_detections.append(
-                        Detection(x1, y1, x2 - x1, y2 - y1,
-                                  track_id, conf, 0.0, "person")
+                        Detection(
+                            x1, y1, x2 - x1, y2 - y1,
+                            int(box.id[0]),
+                            float(box.conf[0]),
+                            0.0,
+                            "person"
+                        )
                     )
 
-        # -------- Tracking loss reset --------
+        # ----------------------------------------------------
+        # TRACKING LOSS HANDLING
+        # ----------------------------------------------------
         if current_state == STATE_CONTROL:
-            ids = [d.id for d in cached_detections]
-            if active_person_id not in ids:
+            if active_person_id not in [d.id for d in cached_detections]:
+                print("[FSM] Active person lost → IDLE")
                 current_state = STATE_IDLE
                 active_person_id = None
                 Following_state = 0
                 last_sent_following_state = None
                 last_action_time = 0.0
 
-        # --------------- Gestures -------------
+        # ----------------------------------------------------
+        # GESTURE ANALYSIS & FSM
+        # ----------------------------------------------------
         for det in cached_detections:
 
+            # In CONTROL, ignore all other people
             if current_state == STATE_CONTROL and det.id != active_person_id:
                 continue
 
-            crop = frame[det.y:det.y+det.h, det.x:det.x+det.w]
+            crop = frame[det.y:det.y + det.h, det.x:det.x + det.w]
             if crop.size == 0:
                 continue
 
@@ -214,56 +260,66 @@ def main():
             if not mp_res.multi_hand_landmarks:
                 continue
 
-            g_name, g_conf = classify_gesture(
-                mp_res.multi_hand_landmarks[0].landmark)
+            gesture, conf = classify_gesture(
+                mp_res.multi_hand_landmarks[0].landmark
+            )
 
-            if g_conf < GESTURE_CONF_THRESHOLD:
-                continue
+            if conf < GESTURE_CONF_THRESHOLD:
+                gesture = "none"
 
             now = time.time()
 
-            # -------- FSM --------
+            # ---------------- FSM LOGIC ----------------
             if current_state == STATE_IDLE:
-                if g_name == "Thumb_Up":
+                if gesture == "Thumb_Up":
                     current_state = STATE_CONTROL
                     active_person_id = det.id
                     Following_state = 0
                     last_sent_following_state = None
                     last_action_time = 0.0
-                    break
+                    print(f"[FSM] CONTROL activated by ID {det.id}")
 
             elif current_state == STATE_CONTROL:
 
-                if now - last_action_time < GESTURE_ACTION_DELAY:
-                    continue
-
-                if g_name == "Pointing_Up":
-                    if Following_state != 1:
+                # ---- Debounced control gestures ----
+                if now - last_action_time >= GESTURE_ACTION_DELAY:
+                    if gesture == "Pointing_Up" and Following_state != 1:
                         Following_state = 1
                         last_action_time = now
+                        print("[FSM] Following_state → 1")
 
-                elif g_name == "Victory":
-                    if Following_state != 0:
+                    elif gesture == "Victory" and Following_state != 0:
                         Following_state = 0
                         last_action_time = now
+                        print("[FSM] Following_state → 0")
 
-                elif g_name == "Rock_n_Roll":
-                    current_state = STATE_IDLE
-                    active_person_id = None
-                    Following_state = 0
-                    last_sent_following_state = None
-                    last_action_time = 0.0
-                    break
+                    elif gesture == "Rock_n_Roll":
+                        print("[FSM] Reset to IDLE")
+                        current_state = STATE_IDLE
+                        active_person_id = None
+                        Following_state = 0
+                        last_sent_following_state = None
+                        last_action_time = 0.0
+                        break
 
-                ai_packet = AI_Data([det],
-                                    Gesture_Data(g_name, det.id, g_conf))
+                # ---- ALWAYS STREAM TRACKING DATA ----
+                ai_packet = AI_Data(
+                    [det],
+                    Gesture_Data(gesture, det.id, conf)
+                )
+
                 try:
                     sock.send(pickle.dumps(ai_packet))
                 except:
+                    print("[TCP] Connection lost")
                     break
 
     cap.release()
     sock.close()
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()
