@@ -1,39 +1,41 @@
+print("Importing openCV...")
 import cv2
+print("Importing numpy...")
 import numpy as np
+print("Importing ultralytics...")
 from ultralytics import YOLO
+print("Importing mediapipe...")
 import mediapipe as mp
 import socket
 import pickle
 import time
 import math
+print("Importing pytorch...")
 import torch
 from ai_data_class import AI_Data, Detection, Gesture_Data, SOCKET_PORT, MAX_MSG_LEN
+from os import environ
 
 # ----------------------------
 # Configuration
 # ----------------------------
-HOST = '192.168.1.1' 
-YOLO_MODEL_NAME = "yolo11n.engine" # Utilise .engine si dispo sur la Jetson, sinon .pt
-CONF_THRESHOLD = 0.5   
+HOST = '192.168.1.1' # IP of pi5 running ros
+YOLO_MODEL_NAME = "yolo11n.pt"
+OBJ_CONF_THRESHOLD = 0.5
 DEVICE = 0 if torch.cuda.is_available() else 'cpu' # Auto-detection GPU
 
-# Optimisation Jetson
-FRAME_SKIP = 3  # Analyse YOLO 1 image sur 3
+OBJ_DETECTION_FRAME_SKIP = 3  # Object detection only every 3 frames
 
 # Seuils de précision Gestes
 RATIO_THRESHOLD_UP = 1.3
 RATIO_THRESHOLD_DOWN = 1.1
 
+no_network = environ.get('NO_NETWORK') is not None
+
 # ----------------------------
 # Init Models
 # ----------------------------
 print(f"Loading YOLO on device='{DEVICE}'...")
-try:
-    # Tente de charger le modèle optimisé TensorRT
-    model = YOLO(YOLO_MODEL_NAME, task='detect')
-except Exception as e:
-    print(f"Engine non trouvé ou erreur: {e}. Chargement du .pt standard.")
-    model = YOLO("yolo11n.pt")
+model = YOLO("yolo11n.pt")
 
 # Warmup GPU
 try:
@@ -45,7 +47,7 @@ print("Loading MediaPipe...")
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
     max_num_hands=1,
-    model_complexity=0, # Crucial pour Jetson
+    model_complexity=0,
     min_detection_confidence=0.5,
     min_tracking_confidence=0.5,
 )
@@ -57,7 +59,15 @@ def calc_distance(p1, p2):
     return math.hypot(p1.x - p2.x, p1.y - p2.y)
 
 def analyze_finger_states(lm):
-    """Analyse géométrique : retourne l'état et la netteté de chaque doigt."""
+    """Analyse géométrique des doigts : retourne l'état (levé/replié) et la netteté de chaque doigt.
+    
+    Paramètres:
+        lm: Liste des 21 landmarks de la main (MediaPipe)
+    
+    Retourne:
+        states: Liste boolean pour chaque doigt [pouce, index, majeur, annulaire, auriculaire]
+        clarity_scores: Scores de confiance pour chaque doigt (0.0 à 1.0)
+    """
     finger_tips = [8, 12, 16, 20]
     finger_pips = [6, 10, 14, 18]
     wrist = lm[0]
@@ -99,7 +109,15 @@ def analyze_finger_states(lm):
     return states, clarity_scores
 
 def classify_gesture(landmarks):
-    """Classification précise avec Score"""
+    """Classifie le geste détecté en comparant avec les patterns connus.
+    Reconnaît: Victory, Pointing_Up, Thumb_Up, Rock_n_Roll
+    
+    Paramètres:
+        landmarks: Landmarks des 21 points de la main
+    
+    Retourne:
+        (nom_geste, score_confiance): Tuple avec le nom du geste et sa confiance (0-100%)
+    """
     states, clarity = analyze_finger_states(landmarks)
     
     patterns = {
@@ -167,10 +185,16 @@ def main():
     cached_detection_list = []
     cached_best_person_idx = -1
 
+    # Variables pour le filtrage des gestes (3 frames consécutifs requis)
+    gesture_confirmation_count = 0 
+    last_confirmed_gesture = "none"
+    last_detected_gesture = "none"
+
     while True: # Main application loop
         
         # 1. BLOCKING: Wait for server before doing anything else
-        sock = connect_socket()
+        if not no_network:
+            sock = connect_socket()
 
         # 2. Inference Loop
         try:
@@ -185,10 +209,10 @@ def main():
                 frame_count += 1
 
                 # -----------------------
-                # A. YOLO (1 frame sur 3)
+                # A. YOLO (1 frame out of 3)
                 # -----------------------
-                if frame_count % FRAME_SKIP == 0:
-                    results = model.track(frame, classes=[0], persist=True, verbose=False, device=DEVICE, conf=CONF_THRESHOLD)
+                if frame_count % OBJ_DETECTION_FRAME_SKIP == 0:
+                    results = model.track(frame, classes=[0], persist=True, verbose=False, device=DEVICE, conf=OBJ_CONF_THRESHOLD)
                     
                     cached_detection_list = []
                     cached_best_person_idx = -1
@@ -216,9 +240,11 @@ def main():
                                 cached_best_person_idx = i
                 
                 # -----------------------
-                # B. GESTURE (A chaque frame)
+                # B. GESTURE (every frame)
                 # -----------------------
-                gesture_obj = Gesture_Data("none", -1, 0.0)
+                detected_gesture = "none"
+                detected_gesture_prob = 0.0
+                detected_gesture_id = -1
                 
                 # On utilise la cached_detection_list pour savoir où regarder
                 if cached_best_person_idx != -1 and cached_best_person_idx < len(cached_detection_list):
@@ -243,19 +269,43 @@ def main():
                         if mp_results.multi_hand_landmarks:
                             # Utilisation de la NOUVELLE fonction précise
                             g_name, g_conf = classify_gesture(mp_results.multi_hand_landmarks[0].landmark)
-                            gesture_obj = Gesture_Data(class_name=g_name, ID=target.id, probability=g_conf)
+                            detected_gesture = g_name
+                            detected_gesture_prob = g_conf
+                            detected_gesture_id = target.id
+                
+                # ------- FILTRE: VALIDATION SUR 3 FRAMES CONSÉCUTIFS -------
+                # Pour éviter les faux positifs, un geste n'est confirmé que s'il est détecté
+                # pendant 3 frames consécutifs. Cela réduit le bruit et les détections erratiques.
+                
+                # Si c'est le même geste détecté à nouveau, incrémenter le compteur
+                if detected_gesture != "none" and detected_gesture == last_detected_gesture:
+                    gesture_confirmation_count += 1
+                else:
+                    # Si le geste a changé ou la détection a été perdue, réinitialiser
+                    gesture_confirmation_count = 0
+                    last_detected_gesture = detected_gesture if detected_gesture != "none" else last_detected_gesture
+                
+                # Confirmer le geste seulement après 3 frames consécutifs
+                if gesture_confirmation_count >= 3:
+                    # Geste validé : créer un objet Gesture_Data avec les données réelles
+                    last_confirmed_gesture = detected_gesture
+                    gesture_obj = Gesture_Data(class_name=detected_gesture, ID=detected_gesture_id, probability=detected_gesture_prob)
+                else:
+                    # Geste pas encore validé : envoyer "none" pour cette frame
+                    gesture_obj = Gesture_Data("none", -1, 0.0)
 
                 # -----------------------
                 # C. SEND DATA
                 # -----------------------
-                # Debug local (optionnel)
-                # print(f"Detections: {len(cached_detection_list)} | Best Gesture: {gesture_obj.class_name} ({gesture_obj.probability:.1f}%)")
+
+                print(f"Detections: {len(cached_detection_list)} | Best Gesture: {gesture_obj.class_name} ({gesture_obj.probability:.1f}%)")
                 
                 ai_packet = AI_Data(cached_detection_list, gesture_obj)
                 try:
                     data = pickle.dumps(ai_packet)
                     if len(data) <= MAX_MSG_LEN:
-                        sock.send(data)
+                        if not no_network:
+                            sock.send(data)
                     else:
                         print("Packet too large, skipping")
                 except BrokenPipeError:
@@ -269,7 +319,8 @@ def main():
             print(f"Error in inference loop: {e}")
             break # Break inner loop to go back to connect_socket()
         finally:
-            sock.close()
+            if not no_network:
+                sock.close()
 
     cap.release()
 
