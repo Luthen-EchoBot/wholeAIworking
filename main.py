@@ -1,17 +1,36 @@
-print("Importing openCV...")
+import time
+class Timer:
+    def __init__(self):
+        self.start = time.time()
+    def elapsed(self):
+        """out:ms"""
+        return 1000*(time.time()-self.start)
+    def __str__(self):
+        return f"{self.elapsed():.1f}ms"
+
+# print("Importing openCV...")
+t = Timer()
 import cv2
-print("Importing numpy...")
+print(f"import cv2: {t}")
+# print("Importing numpy...")
+t = Timer()
 import numpy as np
-print("Importing ultralytics...")
+print(f"import numpy: {t}")
+# print("Importing ultralytics...")
+t = Timer()
 from ultralytics import YOLO
-print("Importing mediapipe...")
+print(f"import ultralytics: {t}")
+# print("Importing mediapipe...")
+t = Timer()
 import mediapipe as mp
+print(f"import mediapipe: {t}")
 import socket
 import pickle
-import time
 import math
-print("Importing pytorch...")
+# print("Importing pytorch...")
+t = Timer()
 import torch
+print(f"import torch: {t}")
 from ai_data_class import AI_Data, Detection, Gesture_Data, SOCKET_PORT, MAX_MSG_LEN
 from os import environ
 
@@ -19,7 +38,7 @@ from os import environ
 # Configuration
 # ----------------------------
 HOST = '192.168.1.1' # IP of pi5 running ros
-YOLO_MODEL_NAME = "yolo11n.pt"
+YOLO_MODEL_NAME = "yolov8n.pt"
 OBJ_CONF_THRESHOLD = 0.5
 DEVICE = 0 if torch.cuda.is_available() else 'cpu' # Auto-detection GPU
 
@@ -31,19 +50,59 @@ RATIO_THRESHOLD_DOWN = 1.1
 
 no_network = environ.get('NO_NETWORK') is not None
 
+## https://stackoverflow.com/questions/43665208/how-to-get-the-latest-frame-from-capture-device-camera-in-opencv
+from threading import Thread
+import queue
+class VideoCapture:
+
+    def __init__(self, name):
+        self.cap = cv2.VideoCapture(name)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 960)
+        
+        self.q = queue.Queue()
+        self.t = Thread(target=self._reader,name="stream_reader")
+        self.t.daemon = True
+        self.t.start()
+  
+    # read frames as soon as they are available, keeping only most recent one
+    def _reader(self):
+        while True:
+            ret, frame = self.cap.read()
+            if not ret:
+                break
+            if not self.q.empty():
+                try:
+                    self.q.get_nowait()   # discard previous (unprocessed) frame
+                except queue.Empty:
+                    pass
+            self.q.put(frame)
+  
+    def read(self):
+        return True,self.q.get()
+    
+    def release(self):
+        self.cap.release()
+
+
 # ----------------------------
 # Init Models
 # ----------------------------
-print(f"Loading YOLO on device='{DEVICE}'...")
-model = YOLO("yolo11n.pt")
+# print(f"Loading YOLO on device='{DEVICE}'...")
+t = Timer()
+model = YOLO(YOLO_MODEL_NAME)
+print(f"YOLO load: {t}")
 
 # Warmup GPU
+t = Timer()
 try:
-    model.predict(source=np.zeros((640,640,3), dtype=np.uint8), device=DEVICE, verbose=False)
+    model.predict(source=np.zeros((640,480,3), dtype=np.uint8), device=DEVICE, verbose=False)
 except:
     pass
+print(f"Warmup: {t}")
 
-print("Loading MediaPipe...")
+# print("Loading MediaPipe...")
+t = Timer()
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
     max_num_hands=1,
@@ -51,6 +110,7 @@ hands = mp_hands.Hands(
     min_detection_confidence=0.5,
     min_tracking_confidence=0.5,
 )
+print(f"mediapipe load: {t}")
 
 # ----------------------------
 # Helper Functions (Math & Gestures)
@@ -173,12 +233,16 @@ def connect_socket():
 # Main
 # ----------------------------
 def main():
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        raise RuntimeError("Cannot open camera")
+    rolling_fps = [0]*15
+    rolling_index = 0
+    t = Timer()
+    cap = VideoCapture(0)
+    print(f"opening cam: {t}")
+    # if not cap.isOpened():
+    #     raise RuntimeError("Cannot open camera")
     
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    # cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    # cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 960)
 
     # Variables pour le Frame Skipping
     frame_count = 0
@@ -199,7 +263,10 @@ def main():
         # 2. Inference Loop
         try:
             while True:
+                total = Timer()
+                t = Timer()
                 ret, frame = cap.read()
+                camread = f"{t}"
                 if not ret: 
                     print("Camera read failed")
                     break
@@ -211,9 +278,14 @@ def main():
                 # -----------------------
                 # A. YOLO (1 frame out of 3)
                 # -----------------------
+                yolotrack=0.0
+                yoloprocess=0.0
                 if frame_count % OBJ_DETECTION_FRAME_SKIP == 0:
+                    t = Timer()
                     results = model.track(frame, classes=[0], persist=True, verbose=False, device=DEVICE, conf=OBJ_CONF_THRESHOLD)
+                    yolotrack = f"{t}"
                     
+                    t = Timer()
                     cached_detection_list = []
                     cached_best_person_idx = -1
                     min_dist_to_center = float('inf')
@@ -238,6 +310,9 @@ def main():
                             if dist < min_dist_to_center:
                                 min_dist_to_center = dist
                                 cached_best_person_idx = i
+                    yoloprocess = f"{t}"
+
+                    cv2.imshow("obj_detection",results[0].plot()) ## => plus de FPS !??????
                 
                 # -----------------------
                 # B. GESTURE (every frame)
@@ -247,6 +322,9 @@ def main():
                 detected_gesture_id = -1
                 
                 # On utilise la cached_detection_list pour savoir où regarder
+                hands_detect = "0.0ms"
+                mediapipe_process = 0.0
+                t = Timer()
                 if cached_best_person_idx != -1 and cached_best_person_idx < len(cached_detection_list):
                     target = cached_detection_list[cached_best_person_idx]
                     
@@ -264,14 +342,19 @@ def main():
                             crop_rgb = cv2.cvtColor(crop_small, cv2.COLOR_BGR2RGB)
                         else:
                             crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                        mediapipe_process = t.elapsed()
 
+                        t = Timer()
                         mp_results = hands.process(crop_rgb)
+                        hands_detect = f"{t}"
+                        t = Timer()
                         if mp_results.multi_hand_landmarks:
                             # Utilisation de la NOUVELLE fonction précise
                             g_name, g_conf = classify_gesture(mp_results.multi_hand_landmarks[0].landmark)
                             detected_gesture = g_name
                             detected_gesture_prob = g_conf
                             detected_gesture_id = target.id
+                mediapipe_process = f"{t.elapsed()+mediapipe_process:.1f}"
                 
                 # ------- FILTRE: VALIDATION SUR 3 FRAMES CONSÉCUTIFS -------
                 # Pour éviter les faux positifs, un geste n'est confirmé que s'il est détecté
@@ -299,7 +382,8 @@ def main():
                 # -----------------------
 
                 print(f"Detections: {len(cached_detection_list)} | Best Gesture: {gesture_obj.class_name} ({gesture_obj.probability:.1f}%)")
-                
+
+                t = Timer()
                 ai_packet = AI_Data(cached_detection_list, gesture_obj)
                 try:
                     data = pickle.dumps(ai_packet)
@@ -311,6 +395,16 @@ def main():
                 except BrokenPipeError:
                     print("Server disconnected.")
                     break # Break inner loop to go back to connect_socket()
+                networking = f"{t}"
+                rolling_fps[rolling_index] = total.elapsed()
+                rolling_index = (rolling_index+1) % len(rolling_fps)
+                if rolling_index == 0:
+                    fps = 1000*len(rolling_fps)/sum(rolling_fps)
+                    print(f"==> FPS: {fps:.1f}")
+                print(f"camread: {camread}, yolotrack: {yolotrack}, yoloprocess: {yoloprocess}, hand_detect: {hands_detect}, mediapipe_process: {mediapipe_process}, network: {networking}, total: {total}")
+
+                if cv2.waitKey(25) & 0xff == ord('q'): # ms, break on 'q' pressed
+                    break
 
         except KeyboardInterrupt:
             print("Stopping...")
@@ -323,6 +417,7 @@ def main():
                 sock.close()
 
     cap.release()
+    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
