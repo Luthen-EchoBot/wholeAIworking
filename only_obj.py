@@ -22,7 +22,7 @@ print(f"Loading YOLO on device='{DEVICE}'...")
 try:
     model = YOLO(YOLO_MODEL_NAME)
     # Force a dummy inference to load model into GPU memory immediately
-    model.predict(source=np.zeros((640,640,3), dtype=np.uint8), device=DEVICE, verbose=False)
+    model.predict(source=np.zeros((640,480,3), dtype=np.uint8), device=DEVICE, verbose=False)
 except Exception as e:
     print(f"Error loading YOLO: {e}")
     exit(1)
