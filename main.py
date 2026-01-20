@@ -67,10 +67,11 @@ YOLO_MODEL_NAME = "yolo11n.pt"
 OBJ_CONF_THRESHOLD = 0.5
 DEVICE = 0 if torch.cuda.is_available() else 'cpu'
 
-OBJ_DETECTION_FRAME_SKIP = 3  # Object detection only every N frames
+OBJ_DETECTION_FRAME_SKIP = 1  # Object detection only every N frames
+HANDS_MAX_SIZE = 300
 
 # Experimental!
-SHOW_GRAPH = True
+SHOW_GRAPH = False
 
 # Seuils de précision Gestes
 RATIO_THRESHOLD_UP = 1.3
@@ -342,8 +343,8 @@ def main():
                     h_crop, w_crop = crop.shape[:2]
                     if h_crop > 20 and w_crop > 20:
                         # Downscale if the image is too large
-                        if h_crop > 300 or w_crop > 300:
-                            scale = 300 / max(h_crop, w_crop)
+                        if h_crop > HANDS_MAX_SIZE or w_crop > HANDS_MAX_SIZE:
+                            scale = HANDS_MAX_SIZE / max(h_crop, w_crop)
                             crop = cv2.resize(crop, (0,0), fx=scale, fy=scale)
                         crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
 
