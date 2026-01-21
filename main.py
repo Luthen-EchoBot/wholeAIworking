@@ -226,7 +226,7 @@ def classify_gesture(landmarks):
         for i in range(5):
             match = match and states[i] == pattern[i]
             if should_be_up and pattern[i]:
-                match = match and fingers_up[i]:
+                match = match and fingers_up[i]
         if match:
             conf = (sum(clarity) / 5.0) * 100
             if conf > best_conf:
