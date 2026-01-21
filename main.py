@@ -138,6 +138,11 @@ with Timer("Loading mediapipe"):
 def calc_distance(p1, p2):
     return math.hypot(p1.x - p2.x, p1.y - p2.y)
 
+def is_up(tip,pip):
+    finger_length = calc_distance(tip,pip)
+    cos_pi_forth = 0.7071
+    return pip.y-tip.y > finger_length * cos_pi_forth
+
 def analyze_finger_states(lm):
     """Analyse géométrique des doigts : retourne l'état (levé/replié) et la netteté de chaque doigt.
     
@@ -151,6 +156,7 @@ def analyze_finger_states(lm):
     finger_tips = [8, 12, 16, 20]
     finger_pips = [6, 10, 14, 18]
     wrist = lm[0]
+    are_fingers_up = []
     states = []
     clarity_scores = []
 
@@ -169,6 +175,7 @@ def analyze_finger_states(lm):
 
     thumb_is_up = condition_out and condition_not_fist
     states.append(thumb_is_up)
+    are_fingers_up.append(is_up(lm[4],lm[2]))
     clarity_scores.append(1.0 if thumb_is_up else 0.5)
 
     # OTHERS
@@ -177,16 +184,17 @@ def analyze_finger_states(lm):
         d_pip = calc_distance(lm[pip_idx], wrist)
         
         ratio = d_tip / (d_pip + 1e-6)
-        is_up = d_tip > d_pip
-        states.append(is_up)
+        finger_is_open = d_tip > d_pip
+        states.append(finger_is_open)
+        are_fingers_up.append(is_up(lm[tip_idx],lm[pip_idx]))
         
-        if is_up:
+        if finger_is_open:
              score = min(max((ratio - 1.0) / (RATIO_THRESHOLD_UP - 1.0), 0.5), 1.0)
         else:
              score = min(max((RATIO_THRESHOLD_DOWN - ratio) / (RATIO_THRESHOLD_DOWN - 0.8), 0.5), 1.0)
         clarity_scores.append(score)
             
-    return states, clarity_scores
+    return states, are_fingers_up, clarity_scores
 
 def classify_gesture(landmarks):
     """Classifie le geste détecté en comparant avec les patterns connus.
@@ -198,33 +206,32 @@ def classify_gesture(landmarks):
     Retourne:
         (nom_geste, score_confiance): Tuple avec le nom du geste et sa confiance (%)
     """
-    states, clarity = analyze_finger_states(landmarks)
+    states, fingers_up, clarity = analyze_finger_states(landmarks)
     
-    patterns = {
-        "Victory":      [False, True, True, False, False],
-        "Pointing_Up":  [False, True, False, False, False],
-        "Thumb_Up":     [True, False, False, False, False],
-        "Rock_n_Roll":  [False, True, False, False, True],
-    }
+    # type: [(label, [which fingers should be "open"], should open fingers be upward)]
+    patterns = [
+        ("Victory",      [False, True, True, False, False],True),
+        # ("Victory",      [True , True, True, False, False],True), # thumb should not be up for Victory
+        ("Pointing_Up",  [False, True, False, False, False],False),
+        ("Thumb_Up",     [True, False, False, False, False],True),
+        ("Rock_n_Roll",  [False, True, False, False, True],False),
+        ("Rock_n_Roll",  [True , True, False, False, True],False)
+    ]
 
     best_label = "none"
     best_conf = 0.0
 
-    for label, pattern in patterns.items():
-        if sum(states[i] == pattern[i] for i in range(5)) == 5:
+    for label, pattern, should_be_up in patterns:
+        match = True
+        for i in range(5):
+            match = match and states[i] == pattern[i]
+            if should_be_up and pattern[i]:
+                match = match and fingers_up[i]:
+        if match:
             conf = (sum(clarity) / 5.0) * 100
             if conf > best_conf:
                 best_conf = conf
                 best_label = label
-
-    # exception pour le pouce
-    if best_label == "none":
-        # Victory pouce sorti
-        if states[1] and states[2] and not states[3] and not states[4]: 
-             best_label = "Victory"; best_conf = (sum(clarity)/5.0)*100
-        # Rock pouce sorti
-        elif states[1] and states[4] and not states[2] and not states[3]: 
-             best_label = "Rock_n_Roll"; best_conf = (sum(clarity)/5.0)*100
 
     if best_conf < 50.0:
         return "none", 0.0
@@ -330,7 +337,7 @@ def main():
                 detected_gesture_id = -1
                 
                 # On utilise la cached_detection_list pour savoir où regarder
-                timer_hands_detect = f"{Timer()}"
+                timer_hands_detect = str(Timer())
                 timer_mediapipe_process = 0.0
                 t = Timer()
                 if cached_best_person_idx != -1 and cached_best_person_idx < len(cached_detection_list):
@@ -373,8 +380,9 @@ def main():
                     gesture_obj = Gesture_Data(class_name=detected_gesture, ID=detected_gesture_id, probability=detected_gesture_prob)
                 else:
                     gesture_obj = Gesture_Data("none", -1, 0.0)
-
-                oyez(f"Human detected: {len(cached_detection_list)} | Best Gesture: {gesture_obj.class_name} ({gesture_obj.probability:.1f}%)")
+                
+                if gesture_obj.class_name != "none":
+                    oyez(f"Human detected: {len(cached_detection_list)} | Best Gesture: {gesture_obj.class_name} ({gesture_obj.probability:.1f}%)")
 
                 # Sending data to ROS2 using YAM (Yet Another Middleware)
                 t = Timer()
@@ -397,7 +405,7 @@ def main():
                 if rolling_index == 0:
                     fps = 1000*len(rolling_fps)/sum(rolling_fps)
                     oyez(f"==> FPS: {fps:.1f}")
-                oyez(f"camread: {timer_camread}, yolotrack: {timer_yolotrack}, yoloprocess: {timer_yoloprocess}, hand_detect: {timer_hands_detect}, mediapipe_process: {timer_mediapipe_process}, network: {timer_networking}, total: {total}")
+                # oyez(f"camread: {timer_camread}, yolotrack: {timer_yolotrack}, yoloprocess: {timer_yoloprocess}, hand_detect: {timer_hands_detect}, mediapipe_process: {timer_mediapipe_process}, network: {timer_networking}, total: {total}")
 
                 if SHOW_GRAPH:
                     if cv2.waitKey(25) & 0xff == ord('q'): # ms, break on 'q' pressed
